@@ -20,6 +20,9 @@ from tokenization.tree_tokenizer import build_tree_tokenizer
 from env.tree_env import UpDownTree, TreeConfig
 from utils.masking import TreeLogitsProcessor
 from models.build import ModelCfg, build_models_for_trl21
+import json
+import math
+import csv
 
 
 @dataclass
@@ -186,7 +189,7 @@ def main():
         out = policy.generate(
             inputs=queries,
             generation_config=gen_cfg,
-            logits_processor=[logits_processor],
+        logits_processor=[logits_processor],
             return_dict_in_generate=True,
         )
         responses = out.sequences.to(device)
@@ -282,6 +285,65 @@ def main():
             "eval/q_sample": q_sample,
             "eval/analytic_seq_entropy_proxy": analytic_seq_entropy,
         })
+
+    # Exact entropy over all legal sequences (enumeration for small H)
+    def compute_exact_sequence_probs(model, tokenizer, env, id_U, id_D, id_EOS):
+        device = next(model.parameters()).device
+        bos = tokenizer.bos_token_id
+        prefixes = [([bos], [], 0.0)]  # (token_ids, actions_wo_specials, logp)
+        finals = []  # list of (action_str, prob)
+        model.eval()
+        with torch.no_grad():
+            while prefixes:
+                next_prefixes = []
+                for token_ids, actions, logp_sum in prefixes:
+                    allow_U, allow_D, allow_EOS = env.legal_actions(actions, id_U, id_D, id_EOS)
+                    allowed_ids = []
+                    if allow_U:
+                        allowed_ids.append(id_U)
+                    if allow_D:
+                        allowed_ids.append(id_D)
+                    if allow_EOS:
+                        allowed_ids.append(id_EOS)
+                    if not allowed_ids:
+                        continue
+                    inp = torch.tensor([token_ids], dtype=torch.long, device=device)
+                    attn = torch.ones_like(inp)
+                    logits = model(input_ids=inp, attention_mask=attn).logits[0, -1]
+                    logZ = torch.logsumexp(logits[allowed_ids], dim=-1).item()
+                    for tok in allowed_ids:
+                        logp_tok = (logits[tok].item() - logZ)
+                        new_logp = logp_sum + logp_tok
+                        if tok == id_EOS:
+                            actions_str = "".join([tokenizer.convert_ids_to_tokens([a])[0] for a in actions])
+                            finals.append((actions_str, math.exp(new_logp)))
+                        else:
+                            new_actions = actions + [tok]
+                            new_tokens = token_ids + [tok]
+                            next_prefixes.append((new_tokens, new_actions, new_logp))
+                prefixes = next_prefixes
+        total_p = sum(p for _, p in finals)
+        if total_p > 0:
+            finals = [(a, p / total_p) for a, p in finals]
+        H = -sum(p * math.log(p + 1e-40) for _, p in finals)
+        return H, finals
+
+    exact_H, seqs = compute_exact_sequence_probs(policy, tokenizer, env, id_U, id_D, id_EOS)
+    report = {
+        "horizon": args.horizon,
+        "num_sequences": len(seqs),
+        "entropy_nats": exact_H,
+        "theoretical_max_nats": math.log(2 + 3 * (2 ** (args.horizon - 2))),
+        "sum_probs": sum(p for _, p in seqs),
+    }
+    os.makedirs(os.path.join(_PROJECT_ROOT, "outputs"), exist_ok=True)
+    with open(os.path.join(_PROJECT_ROOT, "outputs", "ppo_exact_entropy.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    with open(os.path.join(_PROJECT_ROOT, "outputs", "ppo_sequence_probs.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["sequence", "probability"])
+        for a, p in sorted(seqs, key=lambda x: -x[1]):
+            w.writerow([a, p])
 
 
 if __name__ == "__main__":

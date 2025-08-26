@@ -8,3 +8,4 @@ __pycache__/
 outputs/
 checkpoints/
 artifacts/
+trainer_output/

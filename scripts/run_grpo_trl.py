@@ -14,11 +14,15 @@ from datasets import Dataset
 from transformers import GenerationConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
 from trl.trainer.grpo_config import GRPOConfig
+from transformers.trainer_callback import TrainerCallback
 
 from tokenization.tree_tokenizer import build_tree_tokenizer
 from env.tree_env import UpDownTree, TreeConfig
 from utils.masking import TreeLogitsProcessor
 from models.build import ModelCfg, build_models_for_trl21
+import json
+import math
+import csv
 
 
 def compute_sequence_logprobs(
@@ -64,6 +68,48 @@ def compute_sequence_logprobs(
                     token_logps[b, t] = logp
         seq_logp = token_logps.sum(dim=-1)
         return seq_logp
+
+
+def compute_exact_sequence_probs(model, tokenizer, env, id_U, id_D, id_EOS):
+    device = next(model.parameters()).device
+    bos = tokenizer.bos_token_id
+    prefixes = [([bos], [], 0.0)]
+    finals = []
+    model.eval()
+    with torch.no_grad():
+        while prefixes:
+            next_prefixes = []
+            for token_ids, actions, logp_sum in prefixes:
+                allow_U, allow_D, allow_EOS = env.legal_actions(actions, id_U, id_D, id_EOS)
+                allowed_ids = []
+                if allow_U:
+                    allowed_ids.append(id_U)
+                if allow_D:
+                    allowed_ids.append(id_D)
+                if allow_EOS:
+                    allowed_ids.append(id_EOS)
+                if not allowed_ids:
+                    continue
+                inp = torch.tensor([token_ids], dtype=torch.long, device=device)
+                attn = torch.ones_like(inp)
+                logits = model(input_ids=inp, attention_mask=attn).logits[0, -1]
+                logZ = torch.logsumexp(logits[allowed_ids], dim=-1).item()
+                for tok in allowed_ids:
+                    logp_tok = (logits[tok].item() - logZ)
+                    new_logp = logp_sum + logp_tok
+                    if tok == id_EOS:
+                        actions_str = "".join([tokenizer.convert_ids_to_tokens([a])[0] for a in actions])
+                        finals.append((actions_str, math.exp(new_logp)))
+                    else:
+                        new_actions = actions + [tok]
+                        new_tokens = token_ids + [tok]
+                        next_prefixes.append((new_tokens, new_actions, new_logp))
+            prefixes = next_prefixes
+    total_p = sum(p for _, p in finals)
+    if total_p > 0:
+        finals = [(a, p / total_p) for a, p in finals]
+    H = -sum(p * math.log(p + 1e-40) for _, p in finals)
+    return H, finals
 
 
 def make_sequence_self_surprise_reward(ref_model, tokenizer, env, id_U: int, id_D: int, id_EOS: int):
@@ -227,6 +273,81 @@ def main():
     trainer.reward_funcs = [dynamic_reward]
     trainer.reward_func_names = ["self_surprise_ref_k"]
 
+    # Callback: log exact entropy over legal sequences at every step
+    class ExactEntropyLogger(TrainerCallback):
+        def __init__(self, trainer, tokenizer, env, id_U, id_D, id_EOS, out_dir: str = "outputs"):
+            self.trainer = trainer
+            self.tokenizer = tokenizer
+            self.env = env
+            self.id_U = id_U
+            self.id_D = id_D
+            self.id_EOS = id_EOS
+            self.out_dir = out_dir
+            os.makedirs(self.out_dir, exist_ok=True)
+            self.csv_path = os.path.join(self.out_dir, "grpo_entropy_timeseries.csv")
+            if not os.path.exists(self.csv_path):
+                with open(self.csv_path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["step", "entropy_nats"])  # header
+
+        def on_step_end(self, args, state, control, **kwargs):  # type: ignore[override]
+            model_eval = self.trainer.accelerator.unwrap_model(self.trainer.model)
+            device = next(model_eval.parameters()).device
+            bos = self.tokenizer.bos_token_id
+            prefixes = [([bos], [], 0.0)]
+            finals = []
+            model_eval.eval()
+            with torch.no_grad():
+                while prefixes:
+                    next_prefixes = []
+                    for token_ids, actions, logp_sum in prefixes:
+                        allow_U, allow_D, allow_EOS = self.env.legal_actions(actions, self.id_U, self.id_D, self.id_EOS)
+                        allowed_ids = []
+                        if allow_U:
+                            allowed_ids.append(self.id_U)
+                        if allow_D:
+                            allowed_ids.append(self.id_D)
+                        if allow_EOS:
+                            allowed_ids.append(self.id_EOS)
+                        if not allowed_ids:
+                            continue
+                        inp = torch.tensor([token_ids], dtype=torch.long, device=device)
+                        attn = torch.ones_like(inp)
+                        logits = model_eval(input_ids=inp, attention_mask=attn).logits[0, -1]
+                        logZ = torch.logsumexp(logits[allowed_ids], dim=-1).item()
+                        for tok in allowed_ids:
+                            logp_tok = (logits[tok].item() - logZ)
+                            new_logp = logp_sum + logp_tok
+                            if tok == self.id_EOS:
+                                finals.append(("", math.exp(new_logp)))
+                            else:
+                                new_actions = actions + [tok]
+                                new_tokens = token_ids + [tok]
+                                next_prefixes.append((new_tokens, new_actions, new_logp))
+                    prefixes = next_prefixes
+            total_p = sum(p for _, p in finals)
+            if total_p > 0:
+                finals = [(a, p / total_p) for a, p in finals]
+            H = -sum(p * math.log(p + 1e-40) for _, p in finals)
+            # append CSV row only (single time-series file)
+            with open(self.csv_path, "a", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([int(state.global_step), float(H)])
+
+    trainer.add_callback(ExactEntropyLogger(trainer, tokenizer, env, id_U, id_D, id_EOS))
+
+    # Emit BEFORE distribution (initial policy) before training
+    def dump_sequence_probs(model, csv_path):
+        H, seqs = compute_exact_sequence_probs(model, tokenizer, env, id_U, id_D, id_EOS)
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["sequence", "probability"])
+            for a, p in sorted(seqs, key=lambda x: -x[1]):
+                w.writerow([a, p])
+
+    dump_sequence_probs(trainer.accelerator.unwrap_model(trainer.model), os.path.join(_PROJECT_ROOT, "outputs", "before_sequence_probs.csv"))
+
     trainer.train()
 
     # Simple evaluation: sample sequences and report p, q, entropy like PPO script
@@ -312,6 +433,24 @@ def main():
             "eval/p_param": p_param,
             "eval/q_param": q_param,
         })
+
+    exact_H, seqs = compute_exact_sequence_probs(model_eval, tokenizer, env, id_U, id_D, id_EOS)
+    report = {
+        "horizon": args.horizon,
+        "num_sequences": len(seqs),
+        "entropy_nats": exact_H,
+        "theoretical_max_nats": math.log(2 + 3 * (2 ** (args.horizon - 2))),
+        "sum_probs": sum(p for _, p in seqs),
+    }
+    out_dir = os.path.join(_PROJECT_ROOT, "outputs") if "_PROJECT_ROOT" in globals() else "outputs"
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "grpo_exact_entropy.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    with open(os.path.join(out_dir, "after_sequence_probs.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["sequence", "probability"])
+        for a, p in sorted(seqs, key=lambda x: -x[1]):
+            w.writerow([a, p])
 
 
 if __name__ == "__main__":
