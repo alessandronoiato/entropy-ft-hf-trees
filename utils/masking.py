@@ -39,3 +39,4 @@ class TreeLogitsProcessor(LogitsProcessor):
             scores[b][mask] = -1e9
         return scores
 
+

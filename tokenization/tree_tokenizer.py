@@ -46,3 +46,4 @@ def decode_actions(tokenizer: PreTrainedTokenizerFast, ids: List[int]) -> List[s
     # strip special tokens
     return [t for t in tokens if t not in {tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token}]
 
+

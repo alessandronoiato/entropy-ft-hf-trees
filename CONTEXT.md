@@ -11,24 +11,25 @@ Goal: Compare token-level vs sequence-level entropy maximization on a tiny LLM-l
   - PPO approximations: simple PPO (token-level), episodic PPO (sequence-level).
 
 ### This repo (entropyfthf)
-Implements episodic PPO using Hugging Face TRL on a toy Up/Down tree MDP:
+Implements GRPO using Hugging Face TRL on a toy Up/Down tree MDP:
 - Tokenizer: custom 5-token vocab: <bos>, <eos>, <pad>, U, D.
 - Env: UpDownTree with horizon H; first action U forces a line (only U), D keeps branching.
 - Masking: `TreeLogitsProcessor` constrains generation to legal actions.
-- Models: small GPT-2 with a value head via TRL; a frozen reference model for KL and reward.
-- Reward: sequence-level self-surprise under ref: R = -log π_ref(o_{1:T}|q).
-- Trainer: TRL PPOTrainer with ref_model (KL trust region).
+- Models: small GPT-2 policy; a reference model used for KL and reward.
+- Reward: sequence-level self-surprise under current ref π_k: R = -log π_k(o_{1:T}|q); ref is resnapshotted every step.
+- Trainer: TRL GRPOTrainer with per-step ref sync (trust region via β).
 
 ### How to run
 - Create venv and install requirements (see README.md).
-- Train:
+- Train (GRPO):
   ```bash
-  python scripts/run_ppo_trl.py --steps 200 --horizon 8 --batch_size 64 --mini_batch_size 16 --lr 1e-4 --kl_coef 0.02
+  python scripts/run_grpo_trl.py --steps 200 --horizon 8 --batch_size 64 --num_generations 4 --lr 1e-4 --beta 0.1
   ```
-- Expected behavior: PPO with sequence-level reward should favor balancing sequence probabilities (higher sequence entropy) over merely flattening token conditionals.
+- Expected behavior: with sequence-level reward tied to π_k and resnapshotting, training increases sequence entropy while keeping a KL trust-region to the previous policy.
 
 ### Notes
 - The reference model is frozen per run to stabilize KL and reward.
 - You can resnapshot the ref between outer iterations if implementing iterative mirror descent.
 - For comparisons, implement temperature or α-weighted closed-form updates in a sibling script.
+
 

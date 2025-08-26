@@ -19,7 +19,7 @@ from transformers.trainer_callback import TrainerCallback
 from tokenization.tree_tokenizer import build_tree_tokenizer
 from env.tree_env import UpDownTree, TreeConfig
 from utils.masking import TreeLogitsProcessor
-from models.build import ModelCfg, build_models_for_trl21
+from models.build import ModelCfg, build_policy_and_ref
 import json
 import math
 import csv
@@ -172,7 +172,7 @@ def main():
 
     # Models: policy and frozen ref
     model_cfg = ModelCfg(vocab_size=len(tokenizer))
-    policy, _value_model_unused, ref_model, _reward_model_unused = build_models_for_trl21(model_cfg)
+    policy, ref_model = build_policy_and_ref(model_cfg)
 
     # Save policy to a local directory so GRPO can reload both policy and ref from the same model_id path
     artifacts_dir = os.path.join(_PROJECT_ROOT, "artifacts")

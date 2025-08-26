@@ -41,3 +41,4 @@ class UpDownTree:
         # fallback: before first U/D, both allowed
         return True, True, False
 
+
