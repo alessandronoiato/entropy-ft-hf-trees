@@ -48,14 +48,35 @@ def main():
         action="store_true",
         help="If set, use the first CSV's ordering to rank all curves (diagnostic view). Otherwise, rank each curve independently.",
     )
+    parser.add_argument("--env_type", choices=["updown", "udm"], default="updown", help="Environment to classify validity")
+    parser.add_argument("--invalid_only", action="store_true", help="If set, plot only invalid sequences")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+
+    # Helper: classify invalid sequences per env
+    def is_invalid(seq: str) -> bool:
+        # seq is a string like 'UDMUD' without BOS/EOS
+        if not seq:
+            return False
+        first = seq[0]
+        if args.env_type == "updown":
+            if first == 'U' and any(ch != 'U' for ch in seq[1:]):
+                return True
+            return False
+        else:  # udm
+            if first == 'M':
+                return True
+            if first == 'U' and any(ch != 'U' for ch in seq[1:]):
+                return True
+            return False
 
     # Read all curves first
     raw_curves: List[List[Tuple[str, float]]] = []
     for path in args.csv:
         seq_probs = read_sequence_probs(path)
+        if args.invalid_only:
+            seq_probs = [(s, p) for (s, p) in seq_probs if is_invalid(s)]
         raw_curves.append(seq_probs)
 
     if not raw_curves:
@@ -78,8 +99,9 @@ def main():
         for seq_probs in raw_curves:
             d = {s: p for s, p in seq_probs}
             probs = [d.get(s, 0.0) for s in ref_order]
-            Z = sum(probs) or 1.0
-            probs = [p / Z for p in probs]
+            if not args.invalid_only:
+                Z = sum(probs) or 1.0
+                probs = [p / Z for p in probs]
             if args.logy:
                 eps = 1e-12
                 probs = [max(p, eps) for p in probs]
@@ -95,8 +117,9 @@ def main():
                 seq_probs = seq_probs[: args.top_k]
             labels = [s for s, _ in seq_probs]
             probs = [p for _, p in seq_probs]
-            Z = sum(probs) or 1.0
-            probs = [p / Z for p in probs]
+            if not args.invalid_only:
+                Z = sum(probs) or 1.0
+                probs = [p / Z for p in probs]
             if args.logy:
                 eps = 1e-12
                 probs = [max(p, eps) for p in probs]

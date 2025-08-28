@@ -1,7 +1,7 @@
 import argparse
 import os
 import sys
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch import nn
@@ -13,41 +13,58 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from tokenization.tree_tokenizer import build_tree_tokenizer
-from env.tree_env import UpDownTree, TreeConfig
+from env.tree_env import UpDownTree, UpDownMiddleTree, TreeConfig
 from utils.masking import TreeLogitsProcessor
 
 
 class TreeSequences(Dataset):
-    def __init__(self, tokenizer, env: UpDownTree, num_samples: int, horizon: int):
+    def __init__(self, tokenizer, env, num_samples: int, horizon: int, actions: List[str]):
         self.tokenizer = tokenizer
         self.env = env
         self.num_samples = num_samples
         self.horizon = horizon
         self.id_U = tokenizer.convert_tokens_to_ids(["U"])[0]
         self.id_D = tokenizer.convert_tokens_to_ids(["D"])[0]
+        self.id_M: Optional[int] = None
+        if "M" in actions:
+            self.id_M = tokenizer.convert_tokens_to_ids(["M"])[0]
         self.id_EOS = tokenizer.eos_token_id
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx: int):
-        # Sample a legal sequence by uniformly sampling allowed actions
+        # Sample a training sequence obeying pretraining constraints:
+        # - First action cannot be M
+        # - If first is U, force U thereafter
+        # - If first is D, allow U/D and M (if present) thereafter
         ids: List[int] = [self.tokenizer.bos_token_id]
         actions: List[int] = []
+        first_action: Optional[int] = None
         for t in range(self.horizon + 1):
-            allow_U, allow_D, allow_EOS = self.env.legal_actions(actions, self.id_U, self.id_D, self.id_EOS)
-            choices = []
-            if allow_U:
-                choices.append(self.id_U)
-            if allow_D:
-                choices.append(self.id_D)
-            if allow_EOS:
-                choices.append(self.id_EOS)
+            # Determine allowed actions at step t under pretraining rules
+            allow_eos = (t + 1) >= self.horizon
+            if t == 0:
+                # first action: only U or D
+                choices = [self.id_U, self.id_D]
+                # EOS never on first
+            else:
+                if first_action == self.id_U:
+                    choices = [self.id_U]
+                else:
+                    # first_action is D (or None if somehow missing) → allow U/D and M if configured
+                    choices = [self.id_U, self.id_D]
+                    if self.id_M is not None:
+                        choices.append(self.id_M)
+                if allow_eos:
+                    choices.append(self.id_EOS)
             next_id = choices[torch.randint(len(choices), (1,)).item()]
             ids.append(next_id)
             if next_id == self.id_EOS:
                 break
             actions.append(next_id)
+            if t == 0:
+                first_action = next_id
         input_ids = torch.tensor(ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -74,10 +91,12 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--samples", type=int, default=50000)
     parser.add_argument("--out", default=os.path.join(_PROJECT_ROOT, "models", "pretrained.pt"))
+    parser.add_argument("--env_type", choices=["updown", "udm"], default="updown")
     args = parser.parse_args()
 
-    tokenizer = build_tree_tokenizer()
-    env = UpDownTree(TreeConfig(horizon=args.horizon))
+    actions = ["U", "D"] if args.env_type == "updown" else ["U", "D", "M"]
+    tokenizer = build_tree_tokenizer(actions)
+    env = UpDownTree(TreeConfig(horizon=args.horizon)) if args.env_type == "updown" else UpDownMiddleTree(TreeConfig(horizon=args.horizon))
 
     cfg = GPT2Config(
         vocab_size=len(tokenizer),
@@ -91,7 +110,7 @@ def main():
     )
     model = GPT2LMHeadModel(cfg)
 
-    ds = TreeSequences(tokenizer, env, num_samples=args.samples, horizon=args.horizon)
+    ds = TreeSequences(tokenizer, env, num_samples=args.samples, horizon=args.horizon, actions=actions)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_pad(b, tokenizer.pad_token_id))
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))

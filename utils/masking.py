@@ -5,12 +5,11 @@ from transformers import LogitsProcessor
 
 
 class TreeLogitsProcessor(LogitsProcessor):
-    def __init__(self, env, tokenizer, id_U: int, id_D: int, id_EOS: int):
+    def __init__(self, env, tokenizer, action_ids: List[int], id_EOS: int):
         super().__init__()
         self.env = env
         self.tok = tokenizer
-        self.id_U = id_U
-        self.id_D = id_D
+        self.action_ids = action_ids
         self.id_EOS = id_EOS
 
     def _ids_to_actions(self, ids: List[int]) -> List[int]:
@@ -24,19 +23,19 @@ class TreeLogitsProcessor(LogitsProcessor):
         for b in range(batch):
             ids = input_ids[b].tolist()
             actions = self._ids_to_actions(ids)
-            allow_U, allow_D, allow_EOS = self.env.legal_actions(actions, self.id_U, self.id_D, self.id_EOS)
-            mask = torch.zeros(vocab, dtype=torch.bool, device=scores.device)
-            # disallow everything by default
-            mask[:] = True
-            # allow subset
-            if allow_U:
-                mask[self.id_U] = False
-            if allow_D:
-                mask[self.id_D] = False
-            if allow_EOS:
-                mask[self.id_EOS] = False
+            # Ask env for allowed ids, supporting both 2-action and 3-action trees (generic API only)
+            if hasattr(self.env, "legal_action_ids"):
+                allowed = self.env.legal_action_ids(actions, self.action_ids, self.id_EOS)
+            elif hasattr(self.env, "legal_actions_ids"):
+                allowed = self.env.legal_actions_ids(actions, self.action_ids, self.id_EOS)
+            else:
+                raise AttributeError("Environment must implement legal_action_ids or legal_actions_ids")
+            mask = torch.ones(vocab, dtype=torch.bool, device=scores.device)
+            for a in allowed:
+                mask[a] = False
             # Do not allow PAD to be generated; it's only for padding returned sequences
             scores[b][mask] = -1e9
         return scores
+
 
 

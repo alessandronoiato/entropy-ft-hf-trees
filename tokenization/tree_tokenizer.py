@@ -6,18 +6,24 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 
-TREE_TOKENS: Dict[str, int] = {
+BASE_TOKENS: Dict[str, int] = {
     "<pad>": 0,
     "<bos>": 1,
     "<eos>": 2,
-    "U": 3,
-    "D": 4,
 }
 
 
-def build_tree_tokenizer() -> PreTrainedTokenizerFast:
+def build_tree_tokenizer(actions: Optional[List[str]] = None) -> PreTrainedTokenizerFast:
     # Build a tiny word-level tokenizer with a fixed vocab
-    model = WordLevel(vocab=TREE_TOKENS, unk_token=None)
+    if actions is None:
+        actions = ["U", "D"]
+    vocab = dict(BASE_TOKENS)
+    next_id = max(vocab.values()) + 1
+    for a in actions:
+        if a not in vocab:
+            vocab[a] = next_id
+            next_id += 1
+    model = WordLevel(vocab=vocab, unk_token=None)
     tok = Tokenizer(model)
     tok.pre_tokenizer = Whitespace()
 
@@ -29,9 +35,9 @@ def build_tree_tokenizer() -> PreTrainedTokenizerFast:
     )
     # map token ids explicitly
     tokenizer.add_tokens([], special_tokens=True)
-    tokenizer.bos_token_id = TREE_TOKENS["<bos>"]
-    tokenizer.eos_token_id = TREE_TOKENS["<eos>"]
-    tokenizer.pad_token_id = TREE_TOKENS["<pad>"]
+    tokenizer.bos_token_id = vocab["<bos>"]
+    tokenizer.eos_token_id = vocab["<eos>"]
+    tokenizer.pad_token_id = vocab["<pad>"]
 
     return tokenizer
 
@@ -45,5 +51,6 @@ def decode_actions(tokenizer: PreTrainedTokenizerFast, ids: List[int]) -> List[s
     tokens = tokenizer.convert_ids_to_tokens(ids)
     # strip special tokens
     return [t for t in tokens if t not in {tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token}]
+
 
 

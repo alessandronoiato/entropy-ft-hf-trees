@@ -17,135 +17,17 @@ from trl.trainer.grpo_config import GRPOConfig
 from transformers.trainer_callback import TrainerCallback
 
 from tokenization.tree_tokenizer import build_tree_tokenizer
-from env.tree_env import UpDownTree, TreeConfig
+from utils.env_factory import make_env, make_actions, action_ids as make_action_ids
 from utils.masking import TreeLogitsProcessor
+from utils.sequence_eval import compute_sequence_logprobs, enumerate_sequence_probs, compute_legal_mass_raw
+from utils.rollout_mask import apply_masked_generate
+from utils.reward import make_self_surprise_reward
 from models.build import ModelCfg, build_policy_and_ref
 import json
 import math
 import csv
 
-
-def compute_sequence_logprobs(
-    model,
-    input_ids: torch.LongTensor,
-    attention_mask: torch.LongTensor,
-    tokenizer,
-    env,
-    id_U: int,
-    id_D: int,
-    id_EOS: int,
-) -> torch.Tensor:
-    # returns masked log p(seq) including BOS->...->EOS, summing next-token logprobs with legality renormalization
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits  # [B, T, V]
-        next_logits = logits[:, :-1, :]
-        next_ids = input_ids[:, 1:]
-        B, S, V = next_logits.shape
-        device = next_logits.device
-        token_logps = torch.zeros((B, S), dtype=next_logits.dtype, device=device)
-        for b in range(B):
-            seq_tokens = input_ids[b].tolist()
-            for t in range(S):
-                prefix_ids = seq_tokens[: t + 1]
-                prefix_actions = [i for i in prefix_ids if i not in {tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id}]
-                allow_U, allow_D, allow_EOS = env.legal_actions(prefix_actions, id_U, id_D, id_EOS)
-                allowed_ids = []
-                if allow_U:
-                    allowed_ids.append(id_U)
-                if allow_D:
-                    allowed_ids.append(id_D)
-                if allow_EOS:
-                    allowed_ids.append(id_EOS)
-                if len(allowed_ids) == 0:
-                    continue
-                logits_bt = next_logits[b, t]
-                allowed_logits = logits_bt[allowed_ids]
-                logZ = torch.logsumexp(allowed_logits, dim=-1)
-                next_id = next_ids[b, t].item()
-                logp = logits_bt[next_id] - logZ
-                if attention_mask[b, t + 1].item() == 1:
-                    token_logps[b, t] = logp
-        seq_logp = token_logps.sum(dim=-1)
-        return seq_logp
-
-
-def compute_exact_sequence_probs(model, tokenizer, env, id_U, id_D, id_EOS):
-    device = next(model.parameters()).device
-    bos = tokenizer.bos_token_id
-    prefixes = [([bos], [], 0.0)]
-    finals = []
-    model.eval()
-    with torch.no_grad():
-        while prefixes:
-            next_prefixes = []
-            for token_ids, actions, logp_sum in prefixes:
-                allow_U, allow_D, allow_EOS = env.legal_actions(actions, id_U, id_D, id_EOS)
-                allowed_ids = []
-                if allow_U:
-                    allowed_ids.append(id_U)
-                if allow_D:
-                    allowed_ids.append(id_D)
-                if allow_EOS:
-                    allowed_ids.append(id_EOS)
-                if not allowed_ids:
-                    continue
-                inp = torch.tensor([token_ids], dtype=torch.long, device=device)
-                attn = torch.ones_like(inp)
-                logits = model(input_ids=inp, attention_mask=attn).logits[0, -1]
-                logZ = torch.logsumexp(logits[allowed_ids], dim=-1).item()
-                for tok in allowed_ids:
-                    logp_tok = (logits[tok].item() - logZ)
-                    new_logp = logp_sum + logp_tok
-                    if tok == id_EOS:
-                        actions_str = "".join([tokenizer.convert_ids_to_tokens([a])[0] for a in actions])
-                        finals.append((actions_str, math.exp(new_logp)))
-                    else:
-                        new_actions = actions + [tok]
-                        new_tokens = token_ids + [tok]
-                        next_prefixes.append((new_tokens, new_actions, new_logp))
-            prefixes = next_prefixes
-    total_p = sum(p for _, p in finals)
-    if total_p > 0:
-        finals = [(a, p / total_p) for a, p in finals]
-    H = -sum(p * math.log(p + 1e-40) for _, p in finals)
-    return H, finals
-
-
-def make_sequence_self_surprise_reward(ref_model, tokenizer, env, id_U: int, id_D: int, id_EOS: int):
-    ref_device = next(ref_model.parameters()).device
-
-    def reward_func(prompts: List[str], completions: List[str], completion_ids: List[List[int]], **kwargs) -> List[float]:
-        # Build input_ids by concatenating tokenized prompt and provided completion ids (already EOS-truncated)
-        prompt_ids_list: List[List[int]] = []
-        for p in prompts:
-            ids = tokenizer(text=p, return_tensors=None, add_special_tokens=False).get("input_ids", None)
-            if ids is None:
-                # PreTrainedTokenizerFast returns a list when return_tensors=None
-                ids = tokenizer(p, add_special_tokens=False)["input_ids"]
-            prompt_ids_list.append(ids)
-
-        batch_ids: List[torch.Tensor] = []
-        for pid, cid in zip(prompt_ids_list, completion_ids):
-            seq = torch.tensor(pid + cid, dtype=torch.long)
-            batch_ids.append(seq)
-
-        # Pad and move to device
-        max_len = max(seq.size(0) for seq in batch_ids)
-        input_ids = torch.full((len(batch_ids), max_len), fill_value=tokenizer.pad_token_id, dtype=torch.long)
-        for i, seq in enumerate(batch_ids):
-            input_ids[i, : seq.size(0)] = seq
-        input_ids = input_ids.to(ref_device)
-        attention_mask = (input_ids != tokenizer.pad_token_id).long().to(ref_device)
-
-        # Compute sequence log-prob under reference model
-        seq_logp_ref = compute_sequence_logprobs(
-            ref_model, input_ids, attention_mask, tokenizer, env, id_U, id_D, id_EOS
-        )
-        rewards = (-seq_logp_ref).float().cpu().tolist()
-        return rewards
-
-    return reward_func
+ 
 
 
 def main():
@@ -163,12 +45,14 @@ def main():
     torch.manual_seed(args.seed)
 
     # Tokenizer and environment
-    tokenizer = build_tree_tokenizer()
-    id_U = tokenizer.convert_tokens_to_ids(["U"])[0]
-    id_D = tokenizer.convert_tokens_to_ids(["D"])[0]
+    env_type = os.environ.get("TREE_ENV_TYPE", "updown").lower()
+    actions = make_actions(env_type)
+    tokenizer = build_tree_tokenizer(actions)
     id_EOS = tokenizer.eos_token_id
-    env = UpDownTree(TreeConfig(horizon=args.horizon))
-    logits_processor = TreeLogitsProcessor(env, tokenizer, id_U, id_D, id_EOS)
+    env = make_env(env_type, args.horizon)
+    # Build action ids list in token order
+    action_ids = make_action_ids(tokenizer, actions)
+    logits_processor = TreeLogitsProcessor(env, tokenizer, action_ids, id_EOS)
 
     # Models: policy and frozen ref
     model_cfg = ModelCfg(vocab_size=len(tokenizer))
@@ -215,7 +99,7 @@ def main():
     train_ds = Dataset.from_dict({"prompt": prompts})
 
     # Reward function: sequence-level self-surprise; initial placeholder uses the initial ref
-    reward_fn = make_sequence_self_surprise_reward(ref_model, tokenizer, env, id_U, id_D, id_EOS)
+    reward_fn = make_self_surprise_reward(trainer=None, tokenizer=tokenizer, env=env, action_ids=action_ids, id_eos=id_EOS)
 
     # Trainer
     trainer = GRPOTrainer(
@@ -228,59 +112,19 @@ def main():
     )
 
     # Inject masking by patching the underlying model's generate method used in GRPO
-    import types
-    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
-    _orig_generate = unwrapped.generate
-
-    def _generate_with_mask(self, *g_args, **g_kwargs):
-        lps = g_kwargs.get("logits_processor", None)
-        if lps is None:
-            g_kwargs["logits_processor"] = [logits_processor]
-        else:
-            l = list(lps)
-            if logits_processor not in l:
-                l = [logits_processor] + l
-            g_kwargs["logits_processor"] = l
-        return _orig_generate(*g_args, **g_kwargs)
-
-    unwrapped.generate = types.MethodType(_generate_with_mask, unwrapped)
+    apply_masked_generate(trainer, logits_processor)
 
     # Replace reward function to dynamically use the current ref_model (π_k) after trainer init
-    def dynamic_reward(prompts, completions, completion_ids, **kwargs):
-        ref = trainer.ref_model if trainer.ref_model is not None else trainer.model
-        ref_device = next(ref.parameters()).device
-        # Build input_ids by concatenating tokenized prompt and provided completion ids
-        prompt_ids_list: List[List[int]] = []
-        for p in prompts:
-            ids = tokenizer(text=p, return_tensors=None, add_special_tokens=False).get("input_ids", None)
-            if ids is None:
-                ids = tokenizer(p, add_special_tokens=False)["input_ids"]
-            prompt_ids_list.append(ids)
-        batch_ids: List[torch.Tensor] = []
-        for pid, cid in zip(prompt_ids_list, completion_ids):
-            seq = torch.tensor(pid + cid, dtype=torch.long)
-            batch_ids.append(seq)
-        max_len = max(seq.size(0) for seq in batch_ids)
-        input_ids = torch.full((len(batch_ids), max_len), fill_value=tokenizer.pad_token_id, dtype=torch.long)
-        for i, seq in enumerate(batch_ids):
-            input_ids[i, : seq.size(0)] = seq
-        input_ids = input_ids.to(ref_device)
-        attention_mask = (input_ids != tokenizer.pad_token_id).long().to(ref_device)
-        seq_logp_ref = compute_sequence_logprobs(ref, input_ids, attention_mask, tokenizer, env, id_U, id_D, id_EOS)
-        rewards = (-seq_logp_ref).float().cpu().tolist()
-        return rewards
-
-    trainer.reward_funcs = [dynamic_reward]
+    trainer.reward_funcs = [make_self_surprise_reward(trainer, tokenizer, env, action_ids, id_EOS)]
     trainer.reward_func_names = ["self_surprise_ref_k"]
 
     # Callback: log exact entropy over legal sequences at every step
     class ExactEntropyLogger(TrainerCallback):
-        def __init__(self, trainer, tokenizer, env, id_U, id_D, id_EOS, out_dir: str = "outputs"):
+        def __init__(self, trainer, tokenizer, env, action_ids: List[int], id_EOS: int, out_dir: str = "outputs"):
             self.trainer = trainer
             self.tokenizer = tokenizer
             self.env = env
-            self.id_U = id_U
-            self.id_D = id_D
+            self.action_ids = action_ids
             self.id_EOS = id_EOS
             self.out_dir = out_dir
             os.makedirs(self.out_dir, exist_ok=True)
@@ -298,55 +142,35 @@ def main():
             finals = []
             model_eval.eval()
             with torch.no_grad():
-                while prefixes:
-                    next_prefixes = []
-                    for token_ids, actions, logp_sum in prefixes:
-                        allow_U, allow_D, allow_EOS = self.env.legal_actions(actions, self.id_U, self.id_D, self.id_EOS)
-                        allowed_ids = []
-                        if allow_U:
-                            allowed_ids.append(self.id_U)
-                        if allow_D:
-                            allowed_ids.append(self.id_D)
-                        if allow_EOS:
-                            allowed_ids.append(self.id_EOS)
-                        if not allowed_ids:
-                            continue
-                        inp = torch.tensor([token_ids], dtype=torch.long, device=device)
-                        attn = torch.ones_like(inp)
-                        logits = model_eval(input_ids=inp, attention_mask=attn).logits[0, -1]
-                        logZ = torch.logsumexp(logits[allowed_ids], dim=-1).item()
-                        for tok in allowed_ids:
-                            logp_tok = (logits[tok].item() - logZ)
-                            new_logp = logp_sum + logp_tok
-                            if tok == self.id_EOS:
-                                finals.append(("", math.exp(new_logp)))
-                            else:
-                                new_actions = actions + [tok]
-                                new_tokens = token_ids + [tok]
-                                next_prefixes.append((new_tokens, new_actions, new_logp))
-                    prefixes = next_prefixes
+                H, finals = enumerate_sequence_probs(model_eval, self.tokenizer, self.env, self.action_ids, self.id_EOS)
             total_p = sum(p for _, p in finals)
             if total_p > 0:
                 finals = [(a, p / total_p) for a, p in finals]
-            H = -sum(p * math.log(p + 1e-40) for _, p in finals)
             # append CSV row only (single time-series file)
             with open(self.csv_path, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([int(state.global_step), float(H)])
 
-    trainer.add_callback(ExactEntropyLogger(trainer, tokenizer, env, id_U, id_D, id_EOS))
+    trainer.add_callback(ExactEntropyLogger(trainer, tokenizer, env, action_ids, id_EOS))
 
     # Emit BEFORE distribution (initial policy) before training
     def dump_sequence_probs(model, csv_path):
-        H, seqs = compute_exact_sequence_probs(model, tokenizer, env, id_U, id_D, id_EOS)
+        H, seqs = enumerate_sequence_probs(model, tokenizer, env, action_ids, id_EOS)
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["sequence", "probability"])
             for a, p in sorted(seqs, key=lambda x: -x[1]):
                 w.writerow([a, p])
+        return H, seqs
 
-    dump_sequence_probs(trainer.accelerator.unwrap_model(trainer.model), os.path.join(_PROJECT_ROOT, "outputs", "before_sequence_probs.csv"))
+    before_csv = os.path.join(_PROJECT_ROOT, "outputs", "before_sequence_probs.csv")
+    model_before = trainer.accelerator.unwrap_model(trainer.model)
+    H_before, seqs_before = dump_sequence_probs(model_before, before_csv)
+    legal_mass_before = compute_legal_mass_raw(model_before, tokenizer, env, action_ids, id_EOS)
+    # Save exact entropy before finetuning
+    with open(os.path.join(_PROJECT_ROOT, "outputs", "before_exact_entropy.json"), "w") as f:
+        json.dump({"entropy_nats": float(H_before), "num_sequences": len(seqs_before)}, f, indent=2)
 
     trainer.train()
 
@@ -376,65 +200,49 @@ def main():
         )
         responses = out.sequences.to(device)
         attention_mask = (responses != tokenizer.pad_token_id).long().to(device)
-        seq_logp_ref = compute_sequence_logprobs(model_eval_ref, responses, attention_mask, tokenizer, env, id_U, id_D, id_EOS)
-        seq_logp_pol = compute_sequence_logprobs(model_eval, responses, attention_mask, tokenizer, env, id_U, id_D, id_EOS)
+        seq_logp_ref = compute_sequence_logprobs(model_eval_ref, responses, attention_mask, tokenizer, env, action_ids, id_EOS)
+        seq_logp_pol = compute_sequence_logprobs(model_eval, responses, attention_mask, tokenizer, env, action_ids, id_EOS)
         mean_reward = (-seq_logp_ref).mean().item()
         approx_kl = (seq_logp_pol - seq_logp_ref).mean().item()
         seq_entropy = (-seq_logp_pol).mean().item()
 
-        # p, q estimates
-        outputs = model_eval(input_ids=responses, attention_mask=attention_mask)
-        logits = outputs.logits[:, :-1, :]
-        B, S, V = logits.shape
-        pU_renorm = torch.zeros((B, S), device=device, dtype=logits.dtype)
-        both_allowed = torch.zeros((B, S), dtype=torch.bool, device=device)
-        first_is_D = torch.zeros((B,), dtype=torch.bool, device=device)
-        for b in range(B):
-            ids = responses[b].tolist()
-            actions = [i for i in ids if i not in {tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id}]
-            if len(actions) > 0 and actions[0] == id_D:
-                first_is_D[b] = True
-            for s in range(S):
-                prefix_ids = responses[b, : s + 1].tolist()
-                prefix_actions = [i for i in prefix_ids if i not in {tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id}]
-                allow_U, allow_D, _ = env.legal_actions(prefix_actions, id_U, id_D, id_EOS)
-                both_allowed[b, s] = bool(allow_U and allow_D)
-                logits_bs = logits[b, s]
-                terms = []
-                if allow_U:
-                    terms.append(logits_bs[id_U])
-                if allow_D:
-                    terms.append(logits_bs[id_D])
-                if len(terms) == 0:
-                    continue
-                logZ_ud = torch.logsumexp(torch.stack(terms), dim=-1)
-                if allow_U:
-                    pU_renorm[b, s] = torch.exp(logits_bs[id_U] - logZ_ud)
+        # Per-action first-step probabilities under policy (masked, renormalized)
+        # Determine allowed action ids at BOS using generic env API
+        empty_prefix: List[int] = []
+        if hasattr(env, "legal_action_ids"):
+            allowed_first = env.legal_action_ids(empty_prefix, action_ids, tokenizer.eos_token_id)
+        elif hasattr(env, "legal_actions_ids"):
+            allowed_first = env.legal_actions_ids(empty_prefix, action_ids, tokenizer.eos_token_id)
+        else:
+            raise AttributeError("Environment must implement legal_action_ids or legal_actions_ids")
+        # Compute next-token distribution at BOS
+        bos = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long, device=device)
+        logits0 = model_eval(input_ids=bos, attention_mask=torch.ones_like(bos)).logits[0, -1]
+        logZ0 = torch.logsumexp(logits0[allowed_first], dim=-1)
+        p_first = {aid: float(torch.exp(logits0[aid] - logZ0).item()) for aid in allowed_first}
 
-        p_param = pU_renorm[:, 0].mean().item()
-        pos_idx = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
-        after_first = pos_idx >= 1
-        mask_q = (first_is_D.unsqueeze(1) & both_allowed & after_first)
-        q_values = pU_renorm[mask_q]
-        q_param = q_values.mean().item() if q_values.numel() > 0 else float("nan")
-
+        # Sample-based first action fractions
         first_actions = responses[:, 1]
-        frac_U = (first_actions == id_U).float().mean().item()
-        frac_D = (first_actions == id_D).float().mean().item()
+        frac_actions = {aid: float((first_actions == aid).float().mean().item()) for aid in action_ids}
         has_eos = (responses == tokenizer.eos_token_id).any(dim=1).float().mean().item()
 
-        print({
+        # Prepare dynamic metrics dict
+        metrics = {
             "eval/mean_reward": mean_reward,
             "eval/approx_kl": approx_kl,
             "eval/seq_entropy": seq_entropy,
-            "eval/frac_U": frac_U,
-            "eval/frac_D": frac_D,
             "eval/has_eos_frac": has_eos,
-            "eval/p_param": p_param,
-            "eval/q_param": q_param,
-        })
+        }
+        # Add per-action probabilities
+        for a_tok, a_id in zip(actions, action_ids):
+            metrics[f"eval/p_{a_tok}"] = p_first.get(a_id, 0.0)
+            metrics[f"eval/frac_{a_tok}"] = frac_actions.get(a_id, 0.0)
 
-    exact_H, seqs = compute_exact_sequence_probs(model_eval, tokenizer, env, id_U, id_D, id_EOS)
+        print(metrics)
+
+    exact_H, seqs = enumerate_sequence_probs(model_eval, tokenizer, env, action_ids, id_EOS)
+    legal_mass_after = compute_legal_mass_raw(model_eval, tokenizer, env, action_ids, id_EOS)
+    cost_excess_invalid = max(0.0, float(legal_mass_before - legal_mass_after))
     report = {
         "horizon": args.horizon,
         "num_sequences": len(seqs),
@@ -445,7 +253,7 @@ def main():
     out_dir = os.path.join(_PROJECT_ROOT, "outputs") if "_PROJECT_ROOT" in globals() else "outputs"
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "grpo_exact_entropy.json"), "w") as f:
-        json.dump(report, f, indent=2)
+        json.dump(report | {"legal_mass_before_raw": float(legal_mass_before), "legal_mass_after_raw": float(legal_mass_after), "excess_invalid_mass": float(cost_excess_invalid)}, f, indent=2)
     with open(os.path.join(out_dir, "after_sequence_probs.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["sequence", "probability"])
