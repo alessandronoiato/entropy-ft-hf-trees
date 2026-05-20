@@ -10,8 +10,7 @@ licence: license
 
 # Model Card for trainer_output
 
-This model is a fine-tuned version of [None](https://huggingface.co/None).
-It has been trained using [TRL](https://github.com/huggingface/trl).
+This model has been trained using [TRL](https://github.com/huggingface/trl).
 
 ## Quick start
 
